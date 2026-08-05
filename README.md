@@ -376,8 +376,8 @@ Prerequisites:
 - Rust stable toolchain
 - Solana CLI
 - Anchor CLI
-- Node.js 18+ (recommended for Next.js 14)
 - Yarn (Anchor.toml test script uses yarn)
+- Next.js frontend runtime (app/) via npm scripts
 
 Install dependencies:
 
