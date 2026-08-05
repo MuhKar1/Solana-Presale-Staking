@@ -15,19 +15,23 @@ pub use errors::*;
 pub use events::*;
 pub use state::*;
 
-declare_id!("BMDPz1QgcibK13BmWDDF7tZCSmJbrqkd9Ek1nq9NkuFa");
+declare_id!("EQFvxjAWVQvy3JBr2wHgVWwjujpUzCt9X42qGaHTMEdn");
 
 #[program]
 pub mod presale {
     use super::*;
 
-    pub fn create_muhoro_token(
-        ctx: Context<CreateMuhoroToken>,
+    pub fn create_token(
+        ctx: Context<CreateToken>,
         decimals: u8,
         initial_supply: u64,
         creator: Option<Pubkey>,
+        name: String,
+        symbol: String,
+        uri: String,
+        description: String,
     ) -> Result<()> {
-        admin::create_muhoro_token(ctx, decimals, initial_supply, creator)
+        admin::create_token(ctx, decimals, initial_supply, creator, name, symbol, uri, description)
     }
 
     pub fn initialize_presale(
@@ -42,6 +46,10 @@ pub mod presale {
         vesting_cliff: i64,
         min_claim_amount: u64,
         referral_bonus_bps: u16,
+        token_name: String,
+        token_symbol: String,
+        token_image_url: String,
+        token_description: String,
         stages: Vec<PresaleStage>,
     ) -> Result<()> {
         admin::initialize_presale(
@@ -56,6 +64,10 @@ pub mod presale {
             vesting_cliff,
             min_claim_amount,
             referral_bonus_bps,
+            token_name,
+            token_symbol,
+            token_image_url,
+            token_description,
             stages,
         )
     }

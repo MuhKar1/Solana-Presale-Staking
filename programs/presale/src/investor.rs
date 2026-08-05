@@ -1,8 +1,8 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 use anchor_spl::{
-    associated_token::get_associated_token_address_with_program_id,
-    token_interface::{Mint, TokenInterface, TransferChecked, transfer_checked},
+    associated_token::get_associated_token_address,
+    token::{TransferChecked, transfer_checked},
 };
 
 use crate::constants::*;
@@ -141,10 +141,9 @@ pub fn buy_tokens<'info>(
             PresaleError::InvalidReferralAccount
         );
 
-        let expected_ref_ata = get_associated_token_address_with_program_id(
+        let expected_ref_ata = get_associated_token_address(
             &ref_key,
             &state.token_mint,
-            &ctx.accounts.token_program.key(),
         );
         require_keys_eq!(
             ref_ata_info.key(),

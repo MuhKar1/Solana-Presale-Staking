@@ -13,6 +13,14 @@ pub struct PresaleState {
     pub admin: Pubkey,
     pub token_mint: Pubkey,
     pub treasury: Pubkey,
+    #[max_len(64)]
+    pub token_name: String,
+    #[max_len(16)]
+    pub token_symbol: String,
+    #[max_len(256)]
+    pub token_image_url: String,
+    #[max_len(256)]
+    pub token_description: String,
     pub soft_cap_lamports: u64,
     pub hard_cap_lamports: u64,
     pub max_contribution_lamports: u64,

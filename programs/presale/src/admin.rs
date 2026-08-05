@@ -1,12 +1,31 @@
-use anchor_lang::prelude::*;
-use anchor_lang::system_program;
+use anchor_lang::{
+    prelude::*,
+    solana_program::program_pack::Pack,
+    system_program,
+};
 use anchor_spl::{
-    token_interface::{
-        spl_token_2022::instruction::AuthorityType,
-        InitializeMint, Mint, MintTo, SetAuthority, TokenInterface, TransferChecked,
-        initialize_mint, mint_to, set_authority, transfer_checked,
+    associated_token,
+    metadata::{
+        CreateMetadataAccountsV3,
+        create_metadata_accounts_v3,
+        mpl_token_metadata::{
+            ID as METADATA_PROGRAM_ID,
+            types::DataV2,
+        },
+    },
+    token::{
+        InitializeMint2,
+        MintTo,
+        SetAuthority,
+        TransferChecked,
+        mint_to,
+        initialize_mint2,
+        set_authority,
+        transfer_checked,
+        spl_token::state::Mint,
     },
 };
+use spl_token::instruction::AuthorityType;
 
 use crate::constants::*;
 use crate::contexts::*;
@@ -14,29 +33,131 @@ use crate::errors::PresaleError;
 use crate::events::*;
 use crate::state::*;
 
-pub fn create_muhoro_token(
-    ctx: Context<CreateMuhoroToken>,
+pub fn create_token(
+    ctx: Context<CreateToken>,
     decimals: u8,
     initial_supply: u64,
     _creator: Option<Pubkey>,
+    name: String,
+    symbol: String,
+    uri: String,
+    description: String,
 ) -> Result<()> {
-    let bump = ctx.bumps.mint_authority;
-    let bump_seed = [bump];
-    let signer_seeds = &[&[MINT_AUTHORITY_SEED, &bump_seed][..]];
+    require!(name.len() <= 32, PresaleError::InvalidTokenMetadata);
+    require!(symbol.len() <= 10, PresaleError::InvalidTokenMetadata);
+    require!(uri.len() <= 200, PresaleError::InvalidTokenMetadata);
 
-    initialize_mint(
+    let (mint_authority, bump) =
+        Pubkey::find_program_address(&[MINT_AUTHORITY_SEED], ctx.program_id);
+    require_keys_eq!(ctx.accounts.mint_authority.key(), mint_authority, PresaleError::InvalidMintAuthority);
+
+    let signer_bump = [bump];
+    let signer_seeds = &[&[MINT_AUTHORITY_SEED, &signer_bump][..]];
+    let mint_key = ctx.accounts.mint.key();
+    let token_program_key = ctx.accounts.token_program.key();
+    require_keys_eq!(ctx.accounts.metadata_program.key(), METADATA_PROGRAM_ID, PresaleError::InvalidTokenMetadata);
+
+    let (metadata_pda, _) = Pubkey::find_program_address(
+        &[b"metadata", METADATA_PROGRAM_ID.as_ref(), mint_key.as_ref()],
+        &METADATA_PROGRAM_ID,
+    );
+    require_keys_eq!(ctx.accounts.metadata.key(), metadata_pda, PresaleError::InvalidTokenMetadata);
+
+    // 1) Allocate a classic SPL mint account.
+    let rent_lamports = Rent::get()?.minimum_balance(Mint::LEN);
+
+    // 2) Create mint account.
+    system_program::create_account(
+        CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            system_program::CreateAccount {
+                from: ctx.accounts.admin.to_account_info(),
+                to: ctx.accounts.mint.to_account_info(),
+            },
+        ),
+        rent_lamports,
+        Mint::LEN as u64,
+        &token_program_key,
+    )?;
+
+    // 3) Initialize classic SPL mint.
+    initialize_mint2(
         CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
-            InitializeMint {
+            InitializeMint2 {
                 mint: ctx.accounts.mint.to_account_info(),
-                rent: ctx.accounts.rent.to_account_info(),
             },
         ),
         decimals,
-        &ctx.accounts.mint_authority.key(),
+        &mint_authority,
         None,
     )?;
 
+    // 4) Create Metaplex metadata account for wallet/indexer compatibility.
+    let metadata_program_info = ctx.accounts.metadata_program.to_account_info();
+    let metadata_account_info = ctx.accounts.metadata.to_account_info();
+    let use_metadata_program = metadata_program_info.executable
+        && metadata_program_info.key() == METADATA_PROGRAM_ID;
+
+    if use_metadata_program {
+        create_metadata_accounts_v3(
+            CpiContext::new_with_signer(
+                metadata_program_info.clone(),
+                CreateMetadataAccountsV3 {
+                    metadata: metadata_account_info.clone(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    mint_authority: ctx.accounts.mint_authority.to_account_info(),
+                    payer: ctx.accounts.admin.to_account_info(),
+                    update_authority: ctx.accounts.mint_authority.to_account_info(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                    rent: ctx.accounts.rent.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            DataV2 {
+                name: name.clone(),
+                symbol: symbol.clone(),
+                uri: uri.clone(),
+                seller_fee_basis_points: 0,
+                creators: None,
+                collection: None,
+                uses: None,
+            },
+            true,
+            true,
+            None,
+        )?;
+    } else {
+        // Metaplex program unavailable on this validator; metadata account will not be created.
+        msg!("Metaplex program not deployed; skipping on-chain metadata account creation");
+    }
+
+    emit!(TokenMetadataInitialized {
+        admin: ctx.accounts.admin.key(),
+        mint: mint_key,
+        name,
+        symbol,
+        uri,
+    });
+
+    // 5) Create admin ATA if absent.
+    if ctx.accounts.admin_token_account.to_account_info().lamports() == 0 {
+        associated_token::create(
+            CpiContext::new(
+                ctx.accounts.associated_token_program.to_account_info(),
+                associated_token::Create {
+                    payer: ctx.accounts.admin.to_account_info(),
+                    associated_token: ctx.accounts.admin_token_account.to_account_info(),
+                    authority: ctx.accounts.admin.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                    token_program: ctx.accounts.token_program.to_account_info(),
+                },
+            ),
+        )?;
+    }
+
+    // 6) Mint initial supply, then revoke mint authority for fixed supply.
     if initial_supply > 0 {
         mint_to(
             CpiContext::new_with_signer(
@@ -65,7 +186,18 @@ pub fn create_muhoro_token(
         None,
     )?;
 
-    msg!("Muhoro token created - immutable and fixed supply");
+    emit!(TokenCreated {
+        admin: ctx.accounts.admin.key(),
+        mint: mint_key,
+        decimals,
+        initial_supply,
+        mint_authority_revoked: true,
+    });
+
+    if !description.is_empty() {
+        msg!("Token description is stored in presale state metadata fields");
+    }
+
     Ok(())
 }
 
@@ -81,6 +213,10 @@ pub fn initialize_presale(
     vesting_cliff: i64,
     min_claim_amount: u64,
     referral_bonus_bps: u16,
+    token_name: String,
+    token_symbol: String,
+    token_image_url: String,
+    token_description: String,
     stages: Vec<PresaleStage>,
 ) -> Result<()> {
     let clock = Clock::get()?;
@@ -109,6 +245,10 @@ pub fn initialize_presale(
         admin: ctx.accounts.admin.key(),
         token_mint: ctx.accounts.mint.key(),
         treasury: ctx.accounts.treasury.key(),
+        token_name,
+        token_symbol,
+        token_image_url,
+        token_description,
         soft_cap_lamports: soft_cap,
         hard_cap_lamports: hard_cap,
         max_contribution_lamports: max_contribution,

@@ -1,6 +1,24 @@
 use anchor_lang::prelude::*;
 
 #[event]
+pub struct TokenMetadataInitialized {
+    pub admin: Pubkey,
+    pub mint: Pubkey,
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+}
+
+#[event]
+pub struct TokenCreated {
+    pub admin: Pubkey,
+    pub mint: Pubkey,
+    pub decimals: u8,
+    pub initial_supply: u64,
+    pub mint_authority_revoked: bool,
+}
+
+#[event]
 pub struct PresaleInitialized {
     pub admin: Pubkey,
     pub token_mint: Pubkey,

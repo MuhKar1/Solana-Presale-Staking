@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "programs/*"
+    "programs/presale"
 ]
 resolver = "2"
 

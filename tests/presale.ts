@@ -3,9 +3,11 @@ import { Program } from "@coral-xyz/anchor";
 import { expect } from "chai";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
-  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
   createAssociatedTokenAccount,
+  getMint,
   createMint,
+  getAssociatedTokenAddressSync,
   mintTo,
 } from "@solana/spl-token";
 import {
@@ -15,6 +17,8 @@ import {
   SystemProgram,
 } from "@solana/web3.js";
 import { Presale } from "../target/types/presale";
+
+const METADATA_PROGRAM_ID = new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
 
 describe("presale", () => {
   anchor.setProvider(anchor.AnchorProvider.env());
@@ -144,7 +148,7 @@ describe("presale", () => {
       6,
       undefined,
       undefined,
-      TOKEN_2022_PROGRAM_ID
+      TOKEN_PROGRAM_ID
     );
 
     const adminTokenAta = await createAssociatedTokenAccount(
@@ -153,7 +157,7 @@ describe("presale", () => {
       mint,
       scenarioAdmin.publicKey,
       undefined,
-      TOKEN_2022_PROGRAM_ID,
+      TOKEN_PROGRAM_ID,
       ASSOCIATED_TOKEN_PROGRAM_ID
     );
     const userTokenAta = await createAssociatedTokenAccount(
@@ -162,7 +166,7 @@ describe("presale", () => {
       mint,
       user.publicKey,
       undefined,
-      TOKEN_2022_PROGRAM_ID,
+      TOKEN_PROGRAM_ID,
       ASSOCIATED_TOKEN_PROGRAM_ID
     );
     const referrerTokenAta = await createAssociatedTokenAccount(
@@ -171,7 +175,7 @@ describe("presale", () => {
       mint,
       referrer.publicKey,
       undefined,
-      TOKEN_2022_PROGRAM_ID,
+      TOKEN_PROGRAM_ID,
       ASSOCIATED_TOKEN_PROGRAM_ID
     );
 
@@ -184,7 +188,7 @@ describe("presale", () => {
       BigInt(5_000_000_000_000),
       [],
       undefined,
-      TOKEN_2022_PROGRAM_ID
+      TOKEN_PROGRAM_ID
     );
 
     const pdas = derive(scenarioAdmin.publicKey, undefined, user.publicKey);
@@ -223,6 +227,10 @@ describe("presale", () => {
         new anchor.BN(vestingCliff),
         new anchor.BN(1),
         opts?.referralBps ?? 500,
+        "Launch Coin",
+        "LC",
+        "https://cdn.example.com/launch.png",
+        "Community launch token",
         stages
       )
       .accounts({
@@ -233,7 +241,7 @@ describe("presale", () => {
         solVault: pdas.solVault,
         admin: scenarioAdmin.publicKey,
         treasury: treasury.publicKey,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
       .signers([scenarioAdmin])
@@ -247,7 +255,7 @@ describe("presale", () => {
         adminTokenAccount: adminTokenAta,
         mint,
         vault: pdas.tokenVault,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
       })
       .signers([scenarioAdmin])
       .rpc();
@@ -313,6 +321,160 @@ describe("presale", () => {
     throw new Error(`Timed out waiting for chain time >= ${ts}`);
   };
 
+  it("bakes admin-supplied metadata into the Metaplex metadata account", async function () {
+    // The program's create_token writes Metaplex metadata for broad wallet
+    // and indexer compatibility.
+    const mint = Keypair.generate();
+    const localAdmin = Keypair.generate();
+    await airdrop(localAdmin.publicKey, 10);
+
+    const [mintAuthority] = PublicKey.findProgramAddressSync(
+      [seeds.mintAuthority],
+      program.programId
+    );
+    const [metadataPda] = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("metadata"),
+        METADATA_PROGRAM_ID.toBuffer(),
+        mint.publicKey.toBuffer(),
+      ],
+      METADATA_PROGRAM_ID
+    );
+
+    const adminAta = getAssociatedTokenAddressSync(
+      mint.publicKey,
+      localAdmin.publicKey,
+      false,
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+    const sig = await program.methods
+      .createToken(
+        6,
+        new anchor.BN(2_500_000_000),
+        null,
+        "Launch Coin",
+        "LC",
+        "https://cdn.example.com/launch.png",
+        "Community launch token"
+      )
+      .accounts({
+        mint: mint.publicKey,
+        mintAuthority,
+        metadata: metadataPda,
+        metadataProgram: METADATA_PROGRAM_ID,
+        adminTokenAccount: adminAta,
+        admin: localAdmin.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+      })
+      .signers([localAdmin, mint])
+      .rpc();
+
+    // Use finalized to avoid the local-validator RPC indexing race.
+    await connection.confirmTransaction(sig, "finalized");
+    const tx = await connection.getTransaction(sig, {
+      commitment: "finalized",
+      maxSupportedTransactionVersion: 0,
+    });
+    expect(tx).to.not.equal(null);
+    const logs = tx?.meta?.logMessages ?? [];
+    const parser = new anchor.EventParser(program.programId, program.coder);
+    const events = [...parser.parseLogs(logs)];
+
+    const metadataEvent = events.find(
+      (e) => e.name.toLowerCase() === "tokenmetadatainitialized"
+    );
+    const createdEvent = events.find(
+      (e) => e.name.toLowerCase() === "tokencreated"
+    );
+    expect(metadataEvent).to.not.equal(undefined);
+    expect(createdEvent).to.not.equal(undefined);
+
+    // Verify metadata account exists and includes expected values.
+    const metadataAccount = await connection.getAccountInfo(metadataPda, "confirmed");
+    expect(metadataAccount).to.not.equal(null);
+    const metadataBytes = metadataAccount!.data;
+    expect(metadataBytes.includes(Buffer.from("Launch Coin"))).to.equal(true);
+    expect(metadataBytes.includes(Buffer.from("LC"))).to.equal(true);
+    expect(metadataBytes.includes(Buffer.from("https://cdn.example.com/launch.png"))).to.equal(true);
+
+    // Mint authority must be removed (supply immutable) after creation.
+    const mintInfo = await getMint(
+      connection,
+      mint.publicKey,
+      "confirmed",
+      TOKEN_PROGRAM_ID
+    );
+    expect(mintInfo.mintAuthority).to.equal(null);
+  });
+
+  it("stores admin-supplied token metadata in the presale state", async () => {
+    const scenarioAdmin = Keypair.generate();
+    await airdrop(scenarioAdmin.publicKey, 10);
+    const treasury = Keypair.generate();
+    await airdrop(treasury.publicKey, 2);
+    const mint = await createMint(
+      connection,
+      payer,
+      scenarioAdmin.publicKey,
+      null,
+      6,
+      undefined,
+      undefined,
+      TOKEN_PROGRAM_ID
+    );
+    const pdas = derive(scenarioAdmin.publicKey);
+
+    const now = await currentChainUnix();
+    const stages = [{
+      pricePerToken: new anchor.BN(50_000),
+      tokensAvailable: new anchor.BN(1_000_000),
+      tokensSoldInStage: new anchor.BN(0),
+    }];
+
+    await program.methods
+      .initializePresale(
+        new anchor.BN(1_000_000),
+        new anchor.BN(2_000_000),
+        new anchor.BN(1_000_000),
+        new anchor.BN(1_000_000),
+        new anchor.BN(now + 60),
+        new anchor.BN(now + 120),
+        new anchor.BN(100),
+        new anchor.BN(60),
+        new anchor.BN(1),
+        100,
+        "Launch Coin",
+        "LC",
+        "https://cdn.example.com/launch.png",
+        "Community launch token",
+        stages
+      )
+      .accounts({
+        state: pdas.state,
+        mint,
+        tokenVault: pdas.tokenVault,
+        vaultPda: pdas.vaultPda,
+        solVault: pdas.solVault,
+        admin: scenarioAdmin.publicKey,
+        treasury: treasury.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([scenarioAdmin])
+      .rpc();
+
+    const state = await program.account.presaleState.fetch(pdas.state);
+    expect(state.tokenName).to.equal("Launch Coin");
+    expect(state.tokenSymbol).to.equal("LC");
+    expect(state.tokenImageUrl).to.equal("https://cdn.example.com/launch.png");
+    expect(state.tokenDescription).to.equal("Community launch token");
+  });
+
   it("rejects invalid init parameters (vesting cliff > duration)", async () => {
     const scenarioAdmin = Keypair.generate();
     await airdrop(scenarioAdmin.publicKey, 10);
@@ -326,7 +488,7 @@ describe("presale", () => {
       6,
       undefined,
       undefined,
-      TOKEN_2022_PROGRAM_ID
+      TOKEN_PROGRAM_ID
     );
     const pdas = derive(scenarioAdmin.publicKey);
 
@@ -350,6 +512,10 @@ describe("presale", () => {
           new anchor.BN(101),
           new anchor.BN(1),
           100,
+          "Launch Coin",
+          "LC",
+          "https://cdn.example.com/launch.png",
+          "Community launch token",
           stages
         )
         .accounts({
@@ -360,7 +526,7 @@ describe("presale", () => {
           solVault: pdas.solVault,
           admin: scenarioAdmin.publicKey,
           treasury: treasury.publicKey,
-          tokenProgram: TOKEN_2022_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
         })
         .signers([scenarioAdmin])
@@ -383,7 +549,7 @@ describe("presale", () => {
           vaultPda: env.vaultPda,
           vesting: env.userVesting,
           referrerTokenAccount: env.referrerTokenAta,
-          tokenProgram: TOKEN_2022_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
           associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         })
@@ -406,7 +572,7 @@ describe("presale", () => {
           vaultPda: env.vaultPda,
           vesting: env.userVesting,
           referrerTokenAccount: fakeRefAta.publicKey,
-          tokenProgram: TOKEN_2022_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
           associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         })
@@ -435,7 +601,7 @@ describe("presale", () => {
         vaultPda: env.vaultPda,
         vesting: env.userVesting,
         referrerTokenAccount: env.referrerTokenAta,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
       })
@@ -464,7 +630,7 @@ describe("presale", () => {
       env.mint,
       attacker.publicKey,
       undefined,
-      TOKEN_2022_PROGRAM_ID,
+      TOKEN_PROGRAM_ID,
       ASSOCIATED_TOKEN_PROGRAM_ID
     );
 
@@ -478,7 +644,7 @@ describe("presale", () => {
         stakeVault: env.stakeVault,
         rewardVault: env.rewardVault,
         vaultPda: env.vaultPda,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
       .signers([env.admin])
@@ -496,7 +662,7 @@ describe("presale", () => {
           mint: env.mint,
           stakeVault: env.stakeVault,
           userToken: env.userTokenAta,
-          tokenProgram: TOKEN_2022_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
         })
         .signers([env.user])
@@ -515,7 +681,7 @@ describe("presale", () => {
           mint: env.mint,
           adminTokenAccount: attackerTokenAta,
           rewardVault: env.rewardVault,
-          tokenProgram: TOKEN_2022_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
         })
         .signers([attacker])
         .rpc(),
@@ -595,7 +761,7 @@ describe("presale", () => {
         stakeVault: env.stakeVault,
         rewardVault: env.rewardVault,
         vaultPda: env.vaultPda,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
       .signers([env.admin])
@@ -614,7 +780,7 @@ describe("presale", () => {
         vaultPda: env.vaultPda,
         vesting: env.userVesting,
         referrerTokenAccount: env.referrerTokenAta,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
       })
@@ -638,7 +804,7 @@ describe("presale", () => {
       BigInt(1_000_000),
       [],
       undefined,
-      TOKEN_2022_PROGRAM_ID
+      TOKEN_PROGRAM_ID
     );
 
     await expectFail(
@@ -651,7 +817,7 @@ describe("presale", () => {
           mint: env.mint,
           adminTokenAccount: env.adminTokenAta,
           rewardVault: env.rewardVault,
-          tokenProgram: TOKEN_2022_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
         })
         .signers([env.admin])
         .rpc(),
@@ -669,7 +835,7 @@ describe("presale", () => {
           mint: env.mint,
           stakeVault: env.stakeVault,
           userToken: env.userTokenAta,
-          tokenProgram: TOKEN_2022_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
         })
         .signers([env.user])
@@ -703,7 +869,7 @@ describe("presale", () => {
         vaultPda: env.vaultPda,
         vesting: env.userVesting,
         referrerTokenAccount: env.referrerTokenAta,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
       })
@@ -731,7 +897,7 @@ describe("presale", () => {
         stakeVault: env.stakeVault,
         rewardVault: env.rewardVault,
         vaultPda: env.vaultPda,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
       .signers([env.admin])
@@ -746,7 +912,7 @@ describe("presale", () => {
         mint: env.mint,
         adminTokenAccount: env.adminTokenAta,
         rewardVault: env.rewardVault,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
       })
       .signers([env.admin])
       .rpc();
@@ -761,7 +927,7 @@ describe("presale", () => {
       BigInt(10_000_000),
       [],
       undefined,
-      TOKEN_2022_PROGRAM_ID
+      TOKEN_PROGRAM_ID
     );
 
     await program.methods
@@ -774,7 +940,7 @@ describe("presale", () => {
         mint: env.mint,
         stakeVault: env.stakeVault,
         userToken: env.userTokenAta,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
       .signers([env.user])
@@ -807,7 +973,7 @@ describe("presale", () => {
         vaultPda: env.vaultPda,
         vesting: env.userVesting,
         referrerTokenAccount: env.referrerTokenAta,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
       })
@@ -847,7 +1013,7 @@ describe("presale", () => {
         vaultPda: env.vaultPda,
         vesting: env.userVesting,
         referrerTokenAccount: env.referrerTokenAta,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
       })
@@ -875,7 +1041,7 @@ describe("presale", () => {
         stakeVault: env.stakeVault,
         rewardVault: env.rewardVault,
         vaultPda: env.vaultPda,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
       .signers([env.admin])
@@ -890,7 +1056,7 @@ describe("presale", () => {
         mint: env.mint,
         adminTokenAccount: env.adminTokenAta,
         rewardVault: env.rewardVault,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
       })
       .signers([env.admin])
       .rpc();
@@ -904,7 +1070,7 @@ describe("presale", () => {
       BigInt(2_000_000),
       [],
       undefined,
-      TOKEN_2022_PROGRAM_ID
+      TOKEN_PROGRAM_ID
     );
 
     await program.methods
@@ -917,7 +1083,7 @@ describe("presale", () => {
         mint: env.mint,
         stakeVault: env.stakeVault,
         userToken: env.userTokenAta,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
       .signers([env.user])
@@ -938,7 +1104,7 @@ describe("presale", () => {
         rewardVault: env.rewardVault,
         vaultPda: env.vaultPda,
         userToken: env.userTokenAta,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
       })
       .signers([env.user])
       .rpc();
@@ -963,7 +1129,7 @@ describe("presale", () => {
         vaultPda: env.vaultPda,
         vesting: env.userVesting,
         referrerTokenAccount: env.referrerTokenAta,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
       })
@@ -992,7 +1158,7 @@ describe("presale", () => {
           vault: env.tokenVault,
           vaultPda: env.vaultPda,
           userTokenAccount: env.userTokenAta,
-          tokenProgram: TOKEN_2022_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
           associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
         })

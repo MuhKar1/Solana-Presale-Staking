@@ -64,6 +64,10 @@ pub enum PresaleError {
     AdminActionsLocked,
     #[msg("Unauthorized")]
     Unauthorized,
+    #[msg("Invalid mint authority")]
+    InvalidMintAuthority,
     #[msg("Invalid reward rate")]
     InvalidRewardRate,
+    #[msg("Invalid token metadata")]
+    InvalidTokenMetadata,
 }

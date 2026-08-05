@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token_interface::{TransferChecked, transfer_checked};
+use anchor_spl::token::{TransferChecked, transfer_checked};
 
 use crate::constants::*;
 use crate::contexts::{ClaimRewards, FundRewardVault, InitializeStaking, Stake, Unstake};
