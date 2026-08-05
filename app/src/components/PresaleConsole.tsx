@@ -55,106 +55,6 @@ const DEFAULT_SALE_DURATION_SECONDS = 600;
 const MIN_VESTING_DURATION_SECONDS = 1;
 const MIN_VESTING_CLIFF_SECONDS = 0;
 
-type ContractAction = {
-  name: string;
-  role: ConsoleMode | "shared";
-  purpose: string;
-  params: string[];
-};
-
-const CONTRACT_ACTIONS: ContractAction[] = [
-  {
-    name: "create_token(decimals, initial_supply, creator, name, symbol, uri, description)",
-    role: "admin",
-    purpose: "Creates a classic SPL mint, writes Metaplex metadata, mints fixed initial supply to the admin ATA, then removes mint authority.",
-    params: [
-      "decimals: u8",
-      "initial_supply: u64",
-      "creator: Option<Pubkey>",
-      "name: String",
-      "symbol: String",
-      "uri: String",
-      "description: String",
-    ],
-  },
-  {
-    name: "initialize_presale(...)",
-    role: "admin",
-    purpose: "Creates the presale state, vaults, timing, caps, token metadata, vesting rules, referral rate, and sale stages.",
-    params: [
-      "soft_cap: u64",
-      "hard_cap: u64",
-      "max_contribution: u64",
-      "tokens_for_sale: u64",
-      "start_time: i64",
-      "end_time: i64",
-      "vesting_duration: i64",
-      "vesting_cliff: i64",
-      "min_claim_amount: u64",
-      "referral_bonus_bps: u16",
-      "token_name: String",
-      "token_symbol: String",
-      "token_image_url: String",
-      "token_description: String",
-      "stages: Vec<PresaleStage>",
-    ],
-  },
-  {
-    name: "fund_presale_vault(amount)",
-    role: "admin",
-    purpose: "Transfers sale tokens from the admin token account into the presale token vault before the sale starts.",
-    params: ["amount: u64"],
-  },
-  {
-    name: "toggle_pause(paused)",
-    role: "admin",
-    purpose: "Pauses or resumes investor actions when admin actions are not locked.",
-    params: ["paused: bool"],
-  },
-  {
-    name: "set_admin_actions_lock(unlock_timestamp)",
-    role: "admin",
-    purpose: "Locks sensitive admin controls until a future Unix timestamp.",
-    params: ["unlock_timestamp: i64"],
-  },
-  {
-    name: "finalize_presale() / withdraw_funds() / withdraw_unsold()",
-    role: "admin",
-    purpose: "Closes the sale after end time, sends raised SOL to treasury if soft cap is met, and returns unsold tokens.",
-    params: ["no instruction parameters"],
-  },
-  {
-    name: "initialize_staking(reward_rate_per_second)",
-    role: "admin",
-    purpose: "Creates the staking pool and reward vault for the configured presale token.",
-    params: ["reward_rate_per_second: u64"],
-  },
-  {
-    name: "fund_reward_vault(amount)",
-    role: "admin",
-    purpose: "Moves reward tokens from admin ATA into the reward vault.",
-    params: ["amount: u64"],
-  },
-  {
-    name: "buy_tokens(sol_amount, referrer)",
-    role: "investor",
-    purpose: "Buys tokens from the current stage, records vesting, and optionally pays a referral bonus.",
-    params: ["sol_amount: u64", "referrer: Option<Pubkey>"],
-  },
-  {
-    name: "claim_vested() / claim_refund()",
-    role: "investor",
-    purpose: "Claims unlocked vested tokens when soft cap is met, or refunds SOL when the sale fails.",
-    params: ["no instruction parameters"],
-  },
-  {
-    name: "stake(amount) / unstake(amount) / claim_rewards()",
-    role: "investor",
-    purpose: "Manages an investor staking position and claims available rewards.",
-    params: ["amount: u64 for stake and unstake", "no parameters for claim_rewards"],
-  },
-];
-
 function asPkString(value: unknown): string {
   if (typeof value === "string") return value;
   if (value instanceof PublicKey) return value.toBase58();
@@ -299,37 +199,6 @@ async function loadProfileFromUri(uri: string): Promise<{ name?: string; symbol?
   }
 }
 
-function ContractReference({ mode }: { mode: ConsoleMode }) {
-  const actions = CONTRACT_ACTIONS.filter((action) => action.role === mode || action.role === "shared");
-  return (
-    <details className="reference-panel" aria-label={`${mode} smart contract reference`}>
-      <summary className="reference-summary">
-        <div>
-          <span className="section-kicker">Technical reference</span>
-          <h2>{mode === "admin" ? "Admin functions and exact parameters" : "Investor functions and exact parameters"}</h2>
-          <p>
-            The app derives program accounts automatically. Open this only when debugging a transaction or matching the UI to the contract.
-          </p>
-        </div>
-        <span className="reference-count">{actions.length} flows</span>
-      </summary>
-      <div className="reference-grid">
-        {actions.map((action) => (
-          <article className="reference-item" key={action.name}>
-            <h3>{action.name}</h3>
-            <p>{action.purpose}</p>
-            <div className="param-list">
-              {action.params.map((param) => (
-                <code key={param}>{param}</code>
-              ))}
-            </div>
-          </article>
-        ))}
-      </div>
-    </details>
-  );
-}
-
 export default function PresaleConsole({ mode }: { mode: ConsoleMode }) {
   const { connection } = useConnection();
   const wallet = useAnchorWallet();
@@ -413,8 +282,17 @@ export default function PresaleConsole({ mode }: { mode: ConsoleMode }) {
   }, []);
 
   useEffect(() => {
-    if (sharedHydrated && wallet?.publicKey && !adminInput) {
-      setAdminInput(wallet.publicKey.toBase58());
+    if (!sharedHydrated || !wallet?.publicKey) return;
+    // When a wallet connects and the stored admin input doesn't match,
+    // clear the stale admin input and default to the connected wallet.
+    const connectedPk = wallet.publicKey.toBase58();
+    const current = adminInput.trim();
+    if (current && current !== connectedPk) {
+      setAdminInput(connectedPk);
+      setMintInput("");
+      setTreasuryInput("");
+    } else if (!current) {
+      setAdminInput(connectedPk);
     }
   }, [wallet, adminInput, sharedHydrated]);
 
@@ -464,10 +342,12 @@ export default function PresaleConsole({ mode }: { mode: ConsoleMode }) {
     return false;
   }, [wallet, stateAdminPk, adminPk]);
 
+  // Auto-load on-chain state when adminPk (and derived statePk) become available.
   useEffect(() => {
-    if (mode !== "investor") return;
     if (!wallet || !adminPk || !statePk) return;
-    void refreshState();
+    if (mode === "investor") {
+      void refreshState();
+    }
   }, [mode, wallet, adminPk, statePk]);
 
   const cluster = process.env.NEXT_PUBLIC_CLUSTER || "devnet";
@@ -523,10 +403,9 @@ export default function PresaleConsole({ mode }: { mode: ConsoleMode }) {
       ? [
           { id: 0, label: "Deployer & Treasury", blurb: "Connect wallet, set admin and treasury." },
           { id: 1, label: "Create Token", blurb: "Deploy the mint and supply." },
-          { id: 2, label: "Configure Sale", blurb: "Set timing, caps, stages and metadata." },
-          { id: 3, label: "Fund Sale Vault", blurb: "Move sale tokens into the vault." },
-          { id: 4, label: "Manage Sale", blurb: "Pause, lock and finalize the sale." },
-          { id: 5, label: "Withdraw & Staking", blurb: "Settle proceeds and set up rewards." },
+          { id: 2, label: "Configure & Fund Sale", blurb: "Set parameters, initialize and fund the vault." },
+          { id: 3, label: "Manage Sale", blurb: "Pause, lock and finalize the sale." },
+          { id: 4, label: "Withdraw & Staking", blurb: "Settle proceeds and set up rewards." },
         ]
       : [
           { id: 0, label: "Overview", blurb: "Token profile and your balance." },
@@ -539,9 +418,8 @@ export default function PresaleConsole({ mode }: { mode: ConsoleMode }) {
     let adminDone = 0;
     if (isConnectedAdmin) adminDone = 1;
     if (isConnectedAdmin && mintPk) adminDone = 2;
-    if (stateData) adminDone = 3;
-    if (stateData && vaultFunded) adminDone = 4;
-    if (presaleEnded) adminDone = 6;
+    if (stateData && vaultFunded) adminDone = 3;
+    if (presaleEnded) adminDone = 5;
 
     // Admin follows a strict order. Investors may jump between any action,
     // so leave their progress unmarked (done = 0).
@@ -554,10 +432,9 @@ export default function PresaleConsole({ mode }: { mode: ConsoleMode }) {
     if (mode !== "admin") return 3;
     if (!isConnectedAdmin) return 0;
     if (!mintPk) return 1;
-    if (!stateData) return 2;
-    if (!vaultFunded) return 3;
-    if (!presaleEnded) return 4;
-    return 5;
+    if (!stateData || !vaultFunded) return 2;
+    if (!presaleEnded) return 3;
+    return 4;
   }, [mode, isConnectedAdmin, mintPk, stateData, vaultFunded, presaleEnded]);
 
   async function getChainNowUnix(): Promise<number> {
@@ -883,7 +760,7 @@ export default function PresaleConsole({ mode }: { mode: ConsoleMode }) {
     if (!mintPk) throw new Error("Enter a valid token mint address.");
     await initializePresaleForMint(mintPk, mintDecimals);
     const fundSig = await fundPresaleVaultForMint(mintPk, mintDecimals);
-    setActiveStep(4);
+    setActiveStep(3);
     return fundSig;
   }
 
@@ -1305,33 +1182,72 @@ export default function PresaleConsole({ mode }: { mode: ConsoleMode }) {
               ? "Connect the wallet that will own the presale and choose the treasury that receives raised SOL."
               : "Review the token and your current vesting and staking position."}
           </p>
-          <div className="row cols3">
-            <div>
-              <label>Admin wallet</label>
-              <input value={adminInput} onChange={(e) => setAdminInput(e.target.value)} placeholder="Admin public key" />
-              <FieldNote>This derives the presale state PDA.</FieldNote>
+
+          {mode === "investor" && stateData && (
+            <div style={{ marginBottom: 16 }}>
+              <div className="token-meta" style={{ marginBottom: 14 }}>
+                {tokenImageUrl ? (
+                  <img src={tokenImageUrl} alt="Token visual" style={{ borderColor: "var(--line)", borderRadius: 10 }} />
+                ) : (
+                  <div className="meta-fallback">No image yet</div>
+                )}
+                <div>
+                  <h3 style={{ margin: 0, fontSize: "1.32rem" }}>{tokenName || "—"}</h3>
+                  <p className="symbol">{tokenSymbol || "—"}</p>
+                  <p style={{ color: "var(--muted)", fontSize: "0.88rem", margin: "6px 0 0" }}>{tokenDescription || "No description yet."}</p>
+                </div>
+              </div>
+              <div className="kv">
+                <span>State loaded: yes</span>
+                <span>Active: {String(presaleActive)}</span>
+                <span>Paused: {String(presalePaused)}</span>
+                <span>Start: {unixToIso(String(getField<any>(stateData, ["startTime", "start_time"], 0))) || "-"}</span>
+                <span>End: {unixToIso(String(getField<any>(stateData, ["endTime", "end_time"], 0))) || "-"}</span>
+                <span>Total raised: {String(getField<any>(stateData, ["totalRaisedLamports", "total_raised_lamports"], 0))}</span>
+                <span>Tokens sold: {String(getField<any>(stateData, ["tokensSold", "tokens_sold"], 0))}</span>
+                <span>Vested locked: {String(getField<any>(vestingData, ["totalLocked", "total_locked"], 0))}</span>
+                <span>Already claimed: {String(getField<any>(vestingData, ["alreadyClaimed", "already_claimed"], 0))}</span>
+              </div>
             </div>
-            <div>
-              <label>Mint address</label>
-              <input value={mintInput} onChange={(e) => setMintInput(e.target.value)} placeholder="Token mint" />
-              <FieldNote>Auto-filled after Create Token or Load On-chain State.</FieldNote>
-            </div>
-            {mode === "admin" ? (
+          )}
+
+          {mode === "investor" && (
+            <details className="compact-details" style={{ marginBottom: 12 }}>
+              <summary>Presale lookup settings</summary>
+              <div className="row cols3" style={{ marginTop: 8 }}>
+                <div>
+                  <label>Admin wallet (presale owner)</label>
+                  <input value={adminInput} onChange={(e) => setAdminInput(e.target.value)} placeholder="Admin public key" />
+                  <FieldNote>The wallet that created the presale.</FieldNote>
+                </div>
+                <div>
+                  <label>Mint address</label>
+                  <input value={mintInput} readOnly={!!mintInput} placeholder="Auto-filled from state" />
+                  <FieldNote>Loaded automatically from on-chain state.</FieldNote>
+                </div>
+              </div>
+            </details>
+          )}
+
+          {mode === "admin" && (
+            <div className="row cols3">
+              <div>
+                <label>Admin wallet</label>
+                <input value={adminInput} onChange={(e) => setAdminInput(e.target.value)} placeholder="Admin public key" />
+                <FieldNote>This derives the presale state PDA.</FieldNote>
+              </div>
+              <div>
+                <label>Mint address</label>
+                <input value={mintInput} onChange={(e) => setMintInput(e.target.value)} placeholder="Token mint" />
+                <FieldNote>Auto-filled after Create Token or Load On-chain State.</FieldNote>
+              </div>
               <div>
                 <label>Treasury wallet</label>
                 <input value={treasuryInput} onChange={(e) => setTreasuryInput(e.target.value)} placeholder="Treasury public key" />
                 <FieldNote>Receives raised SOL after a successful sale.</FieldNote>
               </div>
-            ) : (
-              <div>
-                <label>Sale status</label>
-                <div className="stat-badge" style={{ color: presalePaused ? "var(--danger)" : presaleActive ? "var(--ok)" : "var(--muted)" }}>
-                  {stateData ? (presalePaused ? "Paused" : presaleActive ? "Open" : "Ended") : "Not deployed"}
-                </div>
-                <FieldNote>Refreshed when you load on-chain state.</FieldNote>
-              </div>
-            )}
-          </div>
+            </div>
+          )}
 
           {mode === "admin" && (
             <div className="admin-auth">
@@ -1537,34 +1453,8 @@ export default function PresaleConsole({ mode }: { mode: ConsoleMode }) {
         </section>
       )}
 
-      {/* Admin step 3: Fund Sale Vault */}
+      {/* Admin step 3: Manage Sale */}
       {mode === "admin" && activeStep === 3 && (
-        <section className="card dark-card">
-          <span className="section-kicker">Step {activeStep + 1} of {guide.steps.length}</span>
-          <h2>Fund the Sale Vault</h2>
-          <p className="sub">Move the tokens that investors will buy into the presale vault. This is required before purchases can settle.</p>
-          <div className="row cols3">
-            <div>
-              <label>Tokens to fund</label>
-              <input value={fundPresaleTokens} onChange={(e) => setFundPresaleTokens(e.target.value)} />
-              <FieldNote>Transfer from your wallet into the vault.</FieldNote>
-            </div>
-          </div>
-          <div className="step-controls">
-            <button className="secondary" onClick={() => setActiveStep(2)}>← Back</button>
-            <button
-              disabled={!isConnectedAdmin || !canFundVaultInputs || !!busy}
-              onClick={() => runAdminAction("Fund presale vault", fundPresaleVault)}
-            >
-              {busy === "Fund presale vault" ? "Funding..." : "Fund Vault"}
-            </button>
-            {stateData && vaultFunded && <button className="continue-btn" onClick={() => setActiveStep(4)}>Continue →</button>}
-          </div>
-        </section>
-      )}
-
-      {/* Admin step 4: Manage Sale */}
-      {mode === "admin" && activeStep === 4 && (
         <section className="card dark-card">
           <span className="section-kicker">Step {activeStep + 1} of {guide.steps.length}</span>
           <h2>Manage the Live Sale</h2>
@@ -1590,14 +1480,14 @@ export default function PresaleConsole({ mode }: { mode: ConsoleMode }) {
             <button className="warn" disabled={!isConnectedAdmin || !!busy} onClick={() => runAdminAction("Finalize presale", finalizePresale)}>Finalize Presale</button>
           </div>
           <div className="step-controls">
-            <button className="secondary" onClick={() => setActiveStep(3)}>← Back</button>
-            {stateData && <button className="continue-btn" onClick={() => setActiveStep(5)}>Continue →</button>}
+            <button className="secondary" onClick={() => setActiveStep(2)}>← Back</button>
+            {stateData && <button className="continue-btn" onClick={() => setActiveStep(4)}>Continue →</button>}
           </div>
         </section>
       )}
 
-      {/* Admin step 5: Withdraw & Staking */}
-      {mode === "admin" && activeStep === 5 && (
+      {/* Admin step 4: Withdraw & Staking */}
+      {mode === "admin" && activeStep === 4 && (
         <section className="card dark-card">
           <span className="section-kicker">Step {activeStep + 1} of {guide.steps.length}</span>
           <h2>Withdraw &amp; Staking</h2>
@@ -1632,7 +1522,7 @@ export default function PresaleConsole({ mode }: { mode: ConsoleMode }) {
           </div>
 
           <div className="step-controls">
-            <button className="secondary" onClick={() => setActiveStep(4)}>← Back</button>
+            <button className="secondary" onClick={() => setActiveStep(3)}>← Back</button>
           </div>
         </section>
       )}
@@ -1767,28 +1657,6 @@ export default function PresaleConsole({ mode }: { mode: ConsoleMode }) {
           </div>
         </div>
       </section>
-
-      <details className="reference-panel" style={{ marginTop: 14 }}>
-        <summary className="reference-summary">
-          <div>
-            <span className="section-kicker">Technical reference</span>
-            <h2>Smart contract functions &amp; parameters</h2>
-            <p>Open for the exact on-chain calls behind each step. Useful when debugging transactions.</p>
-          </div>
-          <span className="reference-count">{CONTRACT_ACTIONS.filter((a) => a.role === mode || a.role === "shared").length} flows</span>
-        </summary>
-        <div className="reference-grid">
-          {CONTRACT_ACTIONS.filter((a) => a.role === mode || a.role === "shared").map((action) => (
-            <article className="reference-item" key={action.name}>
-              <h3>{action.name}</h3>
-              <p>{action.purpose}</p>
-              <div className="param-list">
-                {action.params.map((param) => <code key={param}>{param}</code>)}
-              </div>
-            </article>
-          ))}
-        </div>
-      </details>
 
       <p className="footer-note">Devnet dashboard. Keep enough SOL for fees and account creation.</p>
     </main>
